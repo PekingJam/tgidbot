@@ -1,0 +1,15 @@
+services:
+  tgidbot:
+    build: .
+    image: tgidbot:latest
+    container_name: tgidbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
