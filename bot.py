@@ -9,9 +9,12 @@ import html
 import logging
 import os
 import re
+import sqlite3
 import struct
 import sys
+import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import telebot
 from telebot.apihelper import ApiTelegramException
@@ -33,6 +36,94 @@ if not BOT_TOKEN:
     sys.exit("错误：未设置 BOT_TOKEN 环境变量")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+# --------------------------------------------------------------------------
+# 使用统计（极简：只记 时间 / 类型 / 发起者，不记被查对象）
+# --------------------------------------------------------------------------
+TZ = ZoneInfo(os.environ.get("TZ", "Asia/Shanghai"))
+STATS_DB = os.environ.get("STATS_DB", "/data/stats.db")
+ADMIN_IDS = {
+    int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "").strip()) if x.isdigit()
+}
+
+_db_inited = False
+
+
+def _ensure_db():
+    global _db_inited
+    if _db_inited:
+        return
+    d = os.path.dirname(STATS_DB)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    con = sqlite3.connect(STATS_DB)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, kind TEXT, uid INTEGER)"
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
+    con.commit()
+    con.close()
+    _db_inited = True
+
+
+def record_use(m, kind: str = "query"):
+    """记录一次成功查询。统计失败绝不能影响正常回复。"""
+    try:
+        if not m or not getattr(m, "from_user", None):
+            return
+        _ensure_db()
+        con = sqlite3.connect(STATS_DB)
+        con.execute(
+            "INSERT INTO events(ts, kind, uid) VALUES(?,?,?)",
+            (int(time.time()), kind, m.from_user.id),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.warning("记录统计失败: %s", e)
+
+
+def _day_start(offset_days: int = 0) -> int:
+    now = datetime.now(TZ) - timedelta(days=offset_days)
+    d = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(d.timestamp())
+
+
+def _count(start_ts: int, end_ts: int):
+    _ensure_db()
+    con = sqlite3.connect(STATS_DB)
+    n, u = con.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT uid) FROM events WHERE ts >= ? AND ts < ?",
+        (start_ts, end_ts),
+    ).fetchone()
+    con.close()
+    return n or 0, u or 0
+
+
+def stats_text() -> str:
+    now = _day_start(0)
+    tomorrow = now + 86400
+    t_cnt, t_u = _count(now, tomorrow)
+    y_cnt, y_u = _count(now - 86400, now)
+    w_cnt, w_u = _count(_day_start(6), tomorrow)
+    a_cnt, a_u = _count(0, tomorrow)
+
+    _ensure_db()
+    con = sqlite3.connect(STATS_DB)
+    row = con.execute("SELECT MIN(ts) FROM events").fetchone()
+    con.close()
+    first = datetime.fromtimestamp(row[0], TZ).strftime("%Y-%m-%d") if row and row[0] else "—"
+
+    return (
+        "<b>📊 使用统计</b>\n\n"
+        f"<b>今日</b>　　{t_cnt} 次 · {t_u} 人\n"
+        f"<b>昨日</b>　　{y_cnt} 次 · {y_u} 人\n"
+        f"<b>近 7 天</b>　{w_cnt} 次 · {w_u} 人\n"
+        f"<b>累计</b>　　{a_cnt} 次 · {a_u} 人\n\n"
+        f"<i>首次记录：{first}　时区：{TZ.key}</i>\n"
+        "<i>只统计使用次数与去重人数，不记录被查询对象。</i>"
+    )
 
 # --------------------------------------------------------------------------
 # 数据中心信息
@@ -323,7 +414,7 @@ def try_get_chat(target):
         return None
 
 
-def resolve_and_reply(m: telebot.types.Message, target, note: str = "", is_bot=None):
+def resolve_and_reply(m: telebot.types.Message, target, note: str = "", is_bot=None, kind: str = "query"):
     chat = try_get_chat(target)
     if chat is not None:
         text = card_for_chat(chat, is_bot=is_bot)
@@ -341,6 +432,7 @@ def resolve_and_reply(m: telebot.types.Message, target, note: str = "", is_bot=N
         text = card_for_raw_id(raw)
     if note:
         text += f"\n\n<i>{esc(note)}</i>"
+    record_use(m, kind)
     bot.send_message(m.chat.id, text, reply_markup=main_menu(m.chat.type), disable_web_page_preview=True)
 
 
@@ -489,6 +581,7 @@ def cmd_id(m: telebot.types.Message):
         gchat = try_get_chat(m.chat.id)
         text += "\n\n" + ("─" * 14) + "\n\n"
         text += card_for_chat(gchat) if gchat is not None else card_for_raw_id(m.chat.id)
+    record_use(m, "self")
     bot.send_message(m.chat.id, text, reply_markup=main_menu(m.chat.type), disable_web_page_preview=True)
 
 
@@ -499,6 +592,19 @@ def cmd_dc(m: telebot.types.Message):
         "发一张图片（或任意文件）给我，我从它的 file_id 里解出所在数据中心。\n"
         "<i>提示：你自己上传的文件通常落在你所属的 DC 上。</i>",
     )
+
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(m: telebot.types.Message):
+    # 只给管理员用；其他人发 /stats 完全静默，不暴露这个命令存在
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        text = stats_text()
+    except Exception as e:
+        log.exception("读取统计失败")
+        text = f"❌ 统计读取失败：{esc(e)}"
+    bot.send_message(m.chat.id, text, reply_markup=main_menu(m.chat.type))
 
 
 # --------------------------------------------------------------------------
@@ -552,6 +658,7 @@ def on_media(m: telebot.types.Message):
 
     dc = decode_dc_id(fid)
     if dc:
+        record_use(m, "dc")
         bot.send_message(
             m.chat.id,
             f"🗄 <b>文件所在数据中心</b>　{fmt_dc(dc)}\n\n"
@@ -592,6 +699,7 @@ def on_contact(m: telebot.types.Message):
     except Exception as e:
         log.exception("渲染联系人失败")
         text = f"❌ 解析失败：{esc(e)}"
+    record_use(m, "contact")
     bot.send_message(
         m.chat.id, text,
         reply_markup=main_menu(m.chat.type),
@@ -690,6 +798,7 @@ def on_users_shared(m: telebot.types.Message):
         except Exception as e:
             log.exception("渲染共享用户失败")
             text = f"❌ 解析失败：{esc(e)}"
+        record_use(m, "bot" if is_bot else "user")
         bot.send_message(
             m.chat.id, text,
             reply_markup=main_menu(m.chat.type),
@@ -710,6 +819,7 @@ def on_chat_shared(m: telebot.types.Message):
     except Exception as e:
         log.exception("渲染共享聊天失败")
         text = f"❌ 解析失败：{esc(e)}"
+    record_use(m, "channel" if is_channel else "group")
     bot.send_message(
         m.chat.id, text,
         reply_markup=main_menu(m.chat.type),
@@ -766,7 +876,7 @@ def on_text(m: telebot.types.Message):
     # 1) 转发消息优先
     target, note, is_bot = entity_from_forward(m)
     if target is not None:
-        resolve_and_reply(m, target, note or "", is_bot=is_bot)
+        resolve_and_reply(m, target, note or "", is_bot=is_bot, kind="forward")
         return
     if target is None and note:
         bot.send_message(m.chat.id, f"🙈 {note}\n\n这种情况拿不到数字 ID，只能拿到昵称。", reply_markup=main_menu(m.chat.type))
@@ -776,19 +886,19 @@ def on_text(m: telebot.types.Message):
     tl = re.search(r"(?:https?://)?t(?:elegram)?\.(?:me|dog)/(?:joinchat/)?([A-Za-z0-9_+\-]+)", text)
     if tl:
         slug = tl.group(1)
-        resolve_and_reply(m, slug if slug.startswith("+") else "@" + slug)
+        resolve_and_reply(m, slug if slug.startswith("+") else "@" + slug, kind="link")
         return
 
     # 3) @username
     um = re.fullmatch(r"@([A-Za-z0-9_]{4,64})", text)
     if um:
-        resolve_and_reply(m, "@" + um.group(1))
+        resolve_and_reply(m, "@" + um.group(1), kind="user")
         return
 
     # 4) 纯数字 ID
     idm = re.fullmatch(r"-?\d{4,20}", text)
     if idm:
-        resolve_and_reply(m, int(idm.group(0)))
+        resolve_and_reply(m, int(idm.group(0)), kind="id")
         return
 
     bot.send_message(
@@ -807,6 +917,10 @@ def on_text(m: telebot.types.Message):
 if __name__ == "__main__":
     me = bot.get_me()
     log.info("启动成功：@%s (id=%s)", me.username, me.id)
+    if ADMIN_IDS:
+        log.info("管理员：%s　统计库：%s", sorted(ADMIN_IDS), STATS_DB)
+    else:
+        log.warning("未设置 ADMIN_IDS，/stats 对所有人不可用")
     try:
         bot.set_my_commands([
             telebot.types.BotCommand("id", "获取当前用户 ID"),

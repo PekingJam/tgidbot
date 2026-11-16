@@ -15,3 +15,6 @@ venv/
 .vscode/
 .DS_Store
 *.log
+
+# 运行时数据（统计库）
+data/
